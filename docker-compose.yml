@@ -1,0 +1,76 @@
+# app, worker and scheduler are the same image with different commands. The API
+# container never sends a webhook; that happens only in worker.
+#
+# Scale delivery throughput with: docker compose up -d --scale worker=3
+
+x-php: &php
+  build:
+    context: .
+    args:
+      UID: ${UID:-1000}
+      GID: ${GID:-1000}
+  volumes:
+    - .:/var/www/html
+  restart: unless-stopped
+  # No DB_*/QUEUE_* here. Docker's environment lands in $_SERVER, which Laravel's
+  # env() reads before $_ENV, and PHPUnit cannot override $_SERVER even with
+  # force="true", so setting them here would silently point the test suite at the
+  # development database. .env is the single source instead, and has to be anyway:
+  # `artisan serve` does not pass these to its web server.
+  depends_on:
+    mysql:
+      condition: service_healthy
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: webhooks
+      MYSQL_USER: webhooks
+      MYSQL_PASSWORD: secret
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      # 3307 on the host, since 3306 is often taken by a local MySQL.
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  app:
+    <<: *php
+    command: sh -c "php artisan migrate --force && php artisan serve --host=0.0.0.0 --port=8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/up"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  worker:
+    <<: *php
+    # Queue order is priority order: fan-out is rare and fast, deliveries are bulk.
+    command: php artisan queue:work --queue=fanout,webhook-deliveries --tries=1 --sleep=1 --verbose
+    depends_on:
+      mysql:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+
+  scheduler:
+    <<: *php
+    command: php artisan schedule:work
+    depends_on:
+      mysql:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
